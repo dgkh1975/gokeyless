@@ -1,22 +1,25 @@
 # Go Keyless
-[![Build Status](https://travis-ci.org/cloudflare/gokeyless.png?branch=master)](https://travis-ci.org/cloudflare/gokeyless)
-[![GoDoc](https://godoc.org/github.com/cloudflare/gokeyless?status.png)](https://godoc.org/github.com/cloudflare/gokeyless)
+[![Go Test](https://github.com/cloudflare/gokeyless/actions/workflows/go.yml/badge.svg)](https://github.com/cloudflare/gokeyless/actions/workflows/go.yml)
+[![GoDoc](https://pkg.go.dev/badge/github.com/cloudflare/gokeyless)](https://pkg.go.dev/github.com/cloudflare/gokeyless)
 
 <!-- markdown-toc start - Don't edit this section. Run M-x markdown-toc-refresh-toc -->
 **Table of Contents**
 
 - [Go Keyless](#go-keyless)
-    - [Keyless SSL implementation in Go](#keyless-ssl-implementation-in-go)
-    - [Protocol](#protocol)
-    - [Key Management](#key-management)
-        - [Hardware Security Modules](#hardware-security-modules)
+  - [Keyless SSL implementation in Go](#keyless-ssl-implementation-in-go)
+  - [Protocol](#protocol)
+  - [Key Management](#key-management)
+    - [Hardware Security Modules](#hardware-security-modules)
+      - [PKCS #11 Compatable HSM](#pkcs-11-compatable-hsm)
+      - [Azure Key Vault or Managed HSM](#azure-key-vault-or-managed-hsm)
+      - [Google Cloud KMS or Cloud HSM](#google-cloud-kms-or-cloud-hsm)
 - [Deploying](#deploying)
-    - [Installing](#installing)
-        - [Package Installation](#package-installation)
-        - [Source Installation](#source-installation)
-    - [Running](#running)
-    - [Testing](#testing)
-    - [License](#license)
+  - [Installing](#installing)
+    - [Package Installation](#package-installation)
+    - [Source Installation](#source-installation)
+  - [Running](#running)
+  - [Testing](#testing)
+  - [License](#license)
 
 <!-- markdown-toc end -->
 
@@ -142,15 +145,47 @@ Note that the configuration file is the recommended way to specify these options
 
 ### Hardware Security Modules
 
+#### PKCS #11 Compatable HSM
 Private keys can also be stored on a Hardware Security Module. Keyless can access such a key using a [PKCS #11 URI](https://tools.ietf.org/html/rfc7512) in the configuration file. Here are some examples of URIs for keys stored on various HSM providers:
 
+```
+private_key_stores:
     - uri: pkcs11:token=SoftHSM2%20RSA%20Token;id=%03?module-path=/usr/lib64/libsofthsm2.so&pin-value=1234
     - uri: pkcs11:token=accelerator;object=thaleskey?module-path=/opt/nfast/toolkits/pkcs11/libcknfast.so
     - uri: pkcs11:token=YubiKey%20PIV;id=%00?module-path=/usr/lib64/libykcs11.so&pin-value=123456&max-sessions=1
     - uri: pkcs11:token=SoftHSM2%20RSA%20Token;id=%03?module-path=/usr/lib64/libsofthsm2.so&pin-value=1234
     - uri: pkcs11:token=elab2parN;id=%04?module-path=/usr/lib/libCryptoki2_64.so&pin-value=crypto1
+```
 
 Note you must provide exactly one of the `token`, `serial`, or `slot-id` attributes to identify the token.
+
+Full instructions: https://developers.cloudflare.com/ssl/keyless-ssl/hardware-security-modules#communicating-using-pkcs11
+
+#### Azure Key Vault or Managed HSM
+_note: support added in [v1.6.4](https://github.com/cloudflare/gokeyless/releases/tag/v1.6.4)_
+
+Private keys can also be stored in Azure's [key management offerings](https://docs.microsoft.com/en-us/azure/key-vault/keys/about-keys).
+```
+private_key_stores:
+    - uri: https://keyless-hsm-1.managedhsm.azure.net/keys/keyless-a/256400ae07e74327b5d233c15aea837
+    - uri: https://keyless-vault-1.vault.azure.net/keys/keyless-b/d791e7f42b3a4f3ea8acc65014ea6a95
+```
+If gokeyless is running in a VM with Managed Services enabled, auth works out of the box. Otherwise, credentials can also be specified with an env var containing the path to a file. (env vars are defined [here](https://pkg.go.dev/github.com/Azure/go-autorest/autorest/azure/auth#pkg-constants))
+The required roles are `/keys/read/action` and `/keys/sign/action`
+
+Full instructions: https://developers.cloudflare.com/ssl/keyless-ssl/hardware-security-modules/azure-managed-hsm
+
+#### Google Cloud KMS or Cloud HSM
+_note: support added in [v1.6.4](https://github.com/cloudflare/gokeyless/releases/tag/v1.6.4)_
+
+Private keys can also be stored in Google Cloud's [key management offerings](https://cloud.google.com/security-key-management)
+```
+private_key_stores:
+    - uri: projects/abc/locations/us-west1/keyRings/xyz/cryptoKeys/example-key/cryptoKeyVersions/3
+```
+[Application Default Credentials](https://cloud.google.com/docs/authentication/production#automatically) are supported, the required [IAM role](https://cloud.google.com/kms/docs/reference/permissions-and-roles) is `roles/cloudkms.signerVerifier`
+
+Full instructions: https://developers.cloudflare.com/ssl/keyless-ssl/hardware-security-modules/google-cloud-hsm
 
 # Deploying
 
