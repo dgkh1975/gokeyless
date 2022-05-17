@@ -39,5 +39,5 @@ require (
 	golang.org/x/crypto v0.0.0-20191011191535-87dc89f01550
 	golang.org/x/lint v0.0.0-20190930215403-16217165b5de
 	golang.org/x/sync v0.0.0-20190911185100-cd5d95a43a6e // indirect
-	gopkg.in/yaml.v2 v2.2.1
+	gopkg.in/yaml.v2 v2.2.8
 )
