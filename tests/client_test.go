@@ -323,6 +323,57 @@ func (s *IntegrationTestSuite) TestRPC() {
 	require.Equal("Hello World", out)
 }
 
+func (s *IntegrationTestSuite) TestRPCRecovery() {
+	require := require.New(s.T())
+
+	conn, err := s.remote.Dial(s.client)
+	require.NoError(err)
+	defer conn.Close()
+	client := conn.RPC()
+	defer func() {
+		client.Close()
+		conn.Close()
+	}()
+
+	var out string
+	err = client.Call("DummyRPC.SleepAppend", "Hello", &out)
+	require.Error(err)
+
+	err = client.Call("DummyRPC.Append", "Hello", &out)
+	require.NoError(err)
+	require.Equal("Hello World", out)
+}
+
+func (s *IntegrationTestSuite) TestRPCConcurrent() {
+	require := require.New(s.T())
+
+	conn, err := s.remote.Dial(s.client)
+	require.NoError(err)
+	defer conn.Close()
+
+	client := conn.RPC()
+	defer func() {
+		client.Close()
+		conn.Close()
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var out1 int
+	var out2 []byte
+	go func() {
+		client.Call("DummyRPC.PipeWrite", []byte("Hello"), &out1)
+		wg.Done()
+	}()
+	go func() {
+		client.Call("DummyRPC.PipeRead", 5, &out2)
+		wg.Done()
+	}()
+	wg.Wait()
+	require.Equal(5, out1)
+	require.Equal([]byte("Hello"), out2)
+}
+
 func (s *IntegrationTestSuite) TestShutdown() {
 	require := require.New(s.T())
 
@@ -373,4 +424,25 @@ func (s *IntegrationTestSuite) TestShutdown() {
 	s.server = nil
 
 	require.NoError(err)
+}
+
+func (s *IntegrationTestSuite) TestManyOps() {
+	require := require.New(s.T())
+	conn, err := s.remote.Dial(s.client)
+	require.NoError(err)
+	defer conn.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < s.server.Config().MaxConnPendingRequests()*2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := conn.DoOperation(context.Background(), protocol.Operation{
+				Opcode:  protocol.OpSeal,
+				Payload: []byte("fast"),
+			})
+			require.NoError(err)
+		}()
+
+	}
+	wg.Wait()
 }

@@ -8,7 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -64,6 +64,9 @@ type IntegrationTestSuite struct {
 	ecdsaKey   *client.PrivateKey
 	ed25519Key *client.PrivateKey
 	remote     client.Remote
+
+	retryCount int
+	timeout    time.Duration
 }
 
 func fixedCurrentTime() time.Time {
@@ -95,10 +98,21 @@ func (dummySealer) Unseal(op *protocol.Operation) (res []byte, err error) {
 	return
 }
 
-type DummyRPC struct{}
+type DummyRPC struct {
+	pw *io.PipeWriter
+	pr *io.PipeReader
+}
 
 func (DummyRPC) Append(in string, out *string) error {
 	*out = in + " World"
+	return nil
+}
+
+func (DummyRPC) SleepAppend(in string, out *string) error {
+	fmt.Println("sleeping")
+	time.Sleep(20 * time.Second) // Longer than the default client operation timeout
+	fmt.Println("Sleep done")
+	*out = in + "World"
 	return nil
 }
 
@@ -106,9 +120,20 @@ func (DummyRPC) Error(_ string, _ *string) error {
 	return errors.New("remote rpc error")
 }
 
+func (d DummyRPC) PipeWrite(in []byte, out *int) (err error) {
+	*out, err = d.pw.Write(in)
+	return
+}
+
+func (d DummyRPC) PipeRead(in int, out *[]byte) (err error) {
+	*out = make([]byte, in)
+	_, err = d.pr.Read(*out)
+	return
+}
+
 // helper function reads a pub key from a file and convert it to a signer
 func (s *IntegrationTestSuite) NewRemoteSignerByPubKeyFile(filepath string) (crypto.Signer, error) {
-	pemBytes, err := ioutil.ReadFile(filepath)
+	pemBytes, err := os.ReadFile(filepath)
 	if err != nil {
 		return nil, err
 	}
@@ -126,6 +151,11 @@ func (s *IntegrationTestSuite) NewRemoteSignerByPubKeyFile(filepath string) (cry
 func TestSuite(t *testing.T) {
 	s := &IntegrationTestSuite{}
 	suite.Run(t, s)
+	s2 := &IntegrationTestSuite{
+		timeout:    time.Second,
+		retryCount: 3,
+	}
+	suite.Run(t, s2)
 }
 
 // SetupTest sets up a compatible server and client for use by tests.
@@ -138,7 +168,8 @@ func (s *IntegrationTestSuite) SetupTest() {
 	atomic.StoreUint32(&client.TestDisableConnectionPool, 1)
 
 	var err error
-	s.server, err = server.NewServerFromFile(nil, serverCert, serverKey, keylessCA)
+	config := server.DefaultServeConfig().WithSignTimeout(s.timeout).WithSignRetryCount(s.retryCount)
+	s.server, err = server.NewServerFromFile(config, serverCert, serverKey, keylessCA)
 	require.NoError(err)
 	s.server.TLSConfig().Time = fixedCurrentTime
 
@@ -148,15 +179,17 @@ func (s *IntegrationTestSuite) SetupTest() {
 		s.server.SetKeystore(keys)
 	} else {
 		keys := server.NewDefaultKeystore()
-		err = keys.AddFromURI(params.RSAURI, loadURI)
+		err = keys.AddFromURI(params.RSAURI)
 		require.NoError(err)
-		err = keys.AddFromURI(params.ECDSAURI, loadURI)
+		err = keys.AddFromURI(params.ECDSAURI)
 		require.NoError(err)
 		s.server.SetKeystore(keys)
 	}
 
 	s.server.SetSealer(dummySealer{})
-	err = s.server.RegisterRPC(DummyRPC{})
+	d := DummyRPC{}
+	d.pr, d.pw = io.Pipe()
+	err = s.server.RegisterRPC(d)
 	require.NoError(err)
 
 	addr, err := net.ResolveTCPAddr("tcp", "127.0.0.1:0") // let the OS assign a random port

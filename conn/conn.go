@@ -6,12 +6,8 @@ package conn
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"fmt"
-	"io"
 	"net"
-	"net/rpc"
-	"runtime"
 	"sync"
 	"time"
 
@@ -105,13 +101,19 @@ const defaultOpTimeout = 10 * time.Second
 // ErrClosed is the error returned when an already-closed connection is re-used.
 var ErrClosed = fmt.Errorf("use of closed connection")
 
+// ErrNotFound is not really an error, since timeouts race responses
+var ErrNotFound = fmt.Errorf("connection removed")
+
+// ErrTimeout is a timeout error
+var ErrTimeout = fmt.Errorf("request timeout")
+
 // Conn represents an open keyless connection.
 type Conn struct {
 	// In order to read, acquire readMtx; in order to write, acquire writeMtx
 	conn net.Conn
 	// In order to read, acquire mapMtx.RLock(); in order to write, acquire
 	// mapMtx.Lock().
-	listeners map[uint32]chan *protocol.Operation
+	listeners map[uint32]chan *result
 	// In order to modify, acquire mapMtx.Lock().
 	nextID uint32
 
@@ -120,18 +122,23 @@ type Conn struct {
 	// To lock up the connection, always acquire in the following order to avoid
 	// deadlock: writeMtx, mapMtx (don't acquire readMtx).
 	readMtx, writeMtx sync.Mutex
-	mapMtx            sync.RWMutex
+	mapMtx            sync.Mutex
 
 	// In order to read, acquire any mutex in any mode (read or write). In order
 	// to modify, acquire all three.
 	closed bool
 }
 
+type result struct {
+	err error
+	op  *protocol.Operation
+}
+
 // NewConnTimeout constructs a new Conn with the given operation timeout.
 func NewConnTimeout(inner net.Conn, opTimeout time.Duration) *Conn {
 	return &Conn{
 		conn:      inner,
-		listeners: make(map[uint32]chan *protocol.Operation),
+		listeners: make(map[uint32]chan *result),
 		opTimeout: opTimeout,
 	}
 }
@@ -177,54 +184,61 @@ func (c *Conn) DoRead() error {
 	if err != nil {
 		return err
 	}
-
-	// Acquire the map mutex until we're done with the map.
-	c.mapMtx.RLock()
-	if c.closed {
-		// it was closed in the time that we didn't have a lock held
-		c.mapMtx.RUnlock()
-		return ErrClosed
+	l, err := c.extractChannel(pkt.ID)
+	if err != nil {
+		// The timeout fired, our connection was removed.
+		// Not a problem!
+		if err == ErrNotFound {
+			return nil
+		}
+		// Other errors close the whole connection
+		return err
 	}
 
-	// NOTE: Regardless of what happens, it's the writer's responsibility - not
-	// ours - to delete their channel after they receive their response. If we
-	// were to do that ourselves, we could introduce a race condition:
-	// - Writer times out, enters timeout case in select block
-	// - Reader locks the map mutex, finds their channel, sends them the response,
-	//   and deletes the channel from the map.
-	// - Another writer comes, gets the same ID as the currently sleeping waiter,
-	//   and writes their channel into the map.
-	// - The waiter that timed out wakes back up and deletes the wrong channel!
-
-	l, ok := c.listeners[pkt.ID]
-	c.mapMtx.RUnlock()
-	if !ok {
-		// the call to DoOperation hit its timeout and cleared the map and returned;
-		// the error was delivered from that call, so no point in delivering it here
-		// too
-		return nil
-	}
-
-	// In practice, the Go scheduler seems to have a tough time efficiently
-	// scheduling client goroutines. Empirically, adding this line speeds things
-	// up significantly.
-	runtime.Gosched()
-
-	l <- &pkt.Operation
+	l <- &result{op: &pkt.Operation}
 	return nil
 }
 
-// DoOperation executes an entire keyless operation, returning its result.
-func (c *Conn) DoOperation(ctx context.Context, op protocol.Operation) (*protocol.Operation, error) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "Conn.DoOperation")
+func (c *Conn) extractChannel(id uint32) (chan *result, error) {
+	c.mapMtx.Lock()
+	defer c.mapMtx.Unlock()
+	if c.closed {
+		return nil, ErrClosed
+	}
+	ret, ok := c.listeners[id]
+	delete(c.listeners, id)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return ret, nil
+}
+
+func (c *Conn) timeoutRequest(id uint32, timeout time.Duration) {
+	<-time.After(timeout)
+	place, err := c.extractChannel(id)
+	if err != nil {
+		return // the process finished successfully first
+	}
+	place <- &result{err: ErrTimeout}
+}
+
+// IsClosed returns if the connection is closed
+func (c *Conn) IsClosed() bool {
+	c.mapMtx.Lock()
+	defer c.mapMtx.Unlock()
+	return c.closed
+}
+
+// sendOp sends operation, returning a channel to wait for results
+func (c *Conn) sendOp(ctx context.Context, op protocol.Operation) (chan *result, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Conn.sendOp")
 	defer span.Finish()
 	tracing.SetOperationSpanTags(span, &op)
-
 	// NOTE: It's very important that this channel be buffered so that if we
 	// time out, but a reader finds this channel before we have a chance to delete
 	// it from the map, the reader doesn't block forever sending us a value that
 	// we will never receive.
-	response := make(chan *protocol.Operation, 1)
+	response := make(chan *result, 1)
 
 	// Acquire the map mutex and only release it once we're done with the map.
 	c.mapMtx.Lock()
@@ -236,6 +250,7 @@ func (c *Conn) DoOperation(ctx context.Context, op protocol.Operation) (*protoco
 	c.nextID++
 	if _, ok := c.listeners[id]; ok {
 		c.mapMtx.Unlock()
+		c.Close()
 		// TODO: If this becomes an issue in practice, we could consider randomly
 		// generating IDs and spinning until we find an available one (the map
 		// acts as a record of all IDs currently in use).
@@ -257,36 +272,41 @@ func (c *Conn) DoOperation(ctx context.Context, op protocol.Operation) (*protoco
 	err := c.conn.SetWriteDeadline(end)
 	if err != nil {
 		c.writeMtx.Unlock()
-		return nil, fmt.Errorf("could not set write deadline: %v", err)
+		return nil, fmt.Errorf("could not set write deadline: %w", err)
 	}
 	_, err = pkt.WriteTo(c.conn)
 	c.writeMtx.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("could not write to connection: %v", err)
+		return nil, fmt.Errorf("could not write to connection: %w", err)
 	}
-	waitingSpan, ctx := opentracing.StartSpanFromContext(ctx, "Conn.DoOperation.Waiting")
-
 	// Take into account how long we've already been waiting since the beginning
 	// of writing to the connection (which could have taken a while if the
 	// connection was backed up).
 	left := end.Sub(time.Now())
-	select {
-	case op := <-response:
-		waitingSpan.Finish()
-		c.mapMtx.Lock()
-		delete(c.listeners, id)
-		c.mapMtx.Unlock()
-		if op == nil {
-			return nil, ErrClosed
-		}
-		return op, nil
-	case <-time.After(left):
-		waitingSpan.Finish()
-		c.mapMtx.Lock()
-		delete(c.listeners, id)
-		c.mapMtx.Unlock()
-		return nil, fmt.Errorf("operation timed out")
+	go c.timeoutRequest(id, left)
+	return response, nil
+
+}
+
+// DoOperation executes an entire keyless operation, returning its result.
+func (c *Conn) DoOperation(ctx context.Context, op protocol.Operation) (*protocol.Operation, error) {
+	span, ctx := opentracing.StartSpanFromContext(ctx, "Conn.DoOperation")
+	defer span.Finish()
+	tracing.SetOperationSpanTags(span, &op)
+	response, err := c.sendOp(ctx, op)
+	if err != nil {
+		span.SetTag("error", err)
+		return nil, fmt.Errorf("DoOperation: %w", err)
 	}
+	res := <-response
+	if res == nil {
+		return nil, ErrClosed
+	}
+	if res.err != nil {
+		span.SetTag("error", res.err)
+		return nil, fmt.Errorf("DoOperation: resp error: %w", res.err)
+	}
+	return res.op, nil
 }
 
 // Ping sends a ping message over the connection and waits for a corresponding
@@ -314,66 +334,4 @@ func (c *Conn) Ping(ctx context.Context, data []byte) error {
 	default:
 		return fmt.Errorf("ping: got unexpected response opcode: %v", result.Opcode)
 	}
-}
-
-// RPC returns an RPC client which uses the connection. Closing the returned
-// *rpc.Client will cleanup any spawned goroutines, but will not close the
-// underlying connection.
-func (c *Conn) RPC() *rpc.Client {
-	pr, pw := io.Pipe()
-	codec := &clientCodec{c, pr, pw, nil}
-
-	return rpc.NewClientWithCodec(codec)
-}
-
-// clientCodec implements net/rpc.ClientCodec over a connection to a gokeyless
-// server.
-type clientCodec struct {
-	conn *Conn
-
-	pr  *io.PipeReader
-	pw  *io.PipeWriter
-	dec *gob.Decoder
-}
-
-func (cc *clientCodec) WriteRequest(req *rpc.Request, body interface{}) error {
-	buff := &bytes.Buffer{}
-	enc := gob.NewEncoder(buff)
-
-	if err := enc.Encode(req); err != nil {
-		return err
-	} else if err := enc.Encode(body); err != nil {
-		return err
-	}
-
-	result, err := cc.conn.DoOperation(context.Background(), protocol.Operation{
-		Opcode:  protocol.OpRPC,
-		Payload: buff.Bytes(),
-	})
-	if err != nil {
-		return err
-	} else if result.Opcode == protocol.OpError {
-		return result.GetError()
-	} else if result.Opcode != protocol.OpResponse {
-		return fmt.Errorf("wrong response opcode: %v", result.Opcode)
-	} else if _, err = cc.pw.Write(result.Payload); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (cc *clientCodec) ReadResponseHeader(res *rpc.Response) error {
-	// gob decoders are stateful but we encode statelessly, so we need to reset
-	// the decoder after every full read.
-	cc.dec = gob.NewDecoder(cc.pr)
-	return cc.dec.Decode(res)
-}
-
-func (cc *clientCodec) ReadResponseBody(body interface{}) error {
-	return cc.dec.Decode(body)
-}
-
-func (cc *clientCodec) Close() error {
-	return cc.pr.Close()
 }

@@ -4,12 +4,16 @@
 
 // Package pkcs12 implements some of PKCS#12.
 //
-// This implementation is distilled from https://tools.ietf.org/html/rfc7292
-// and referenced documents. It is intended for decoding P12/PFX-stored
-// certificates and keys for use with the crypto/tls package.
+// This implementation is distilled from [RFC 7292] and referenced documents.
+// It is intended for decoding P12/PFX-stored certificates and keys for use
+// with the crypto/tls package.
 //
-// This package is frozen. If it's missing functionality you need, consider
-// an alternative like software.sslmate.com/src/go-pkcs12.
+// The pkcs12 package is [frozen] and is not accepting new features.
+// If it's missing functionality you need, consider an alternative like
+// software.sslmate.com/src/go-pkcs12.
+//
+// [RFC 7292]: https://datatracker.ietf.org/doc/html/rfc7292
+// [frozen]: https://go.dev/wiki/Frozen
 package pkcs12
 
 import (
@@ -30,6 +34,8 @@ var (
 	oidFriendlyName     = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 9, 20})
 	oidLocalKeyID       = asn1.ObjectIdentifier([]int{1, 2, 840, 113549, 1, 9, 21})
 	oidMicrosoftCSPName = asn1.ObjectIdentifier([]int{1, 3, 6, 1, 4, 1, 311, 17, 1})
+
+	errUnknownAttributeOID = errors.New("pkcs12: unknown attribute OID")
 )
 
 type pfxPdu struct {
@@ -104,6 +110,11 @@ func unmarshal(in []byte, out interface{}) error {
 }
 
 // ToPEM converts all "safe bags" contained in pfxData to PEM blocks.
+// Unknown attributes are discarded.
+//
+// Note that although the returned PEM blocks for private keys have type
+// "PRIVATE KEY", the bytes are not encoded according to PKCS #8, but according
+// to PKCS #1 for RSA keys and SEC 1 for ECDSA keys.
 func ToPEM(pfxData []byte, password string) ([]*pem.Block, error) {
 	encodedPassword, err := bmpString(password)
 	if err != nil {
@@ -135,6 +146,9 @@ func convertBag(bag *safeBag, password []byte) (*pem.Block, error) {
 
 	for _, attribute := range bag.Attributes {
 		k, v, err := convertAttribute(&attribute)
+		if err == errUnknownAttributeOID {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +202,7 @@ func convertAttribute(attribute *pkcs12Attribute) (key, value string, err error)
 		key = "Microsoft CSP Name"
 		isString = true
 	default:
-		return "", "", errors.New("pkcs12: unknown attribute with OID " + attribute.Id.String())
+		return "", "", errUnknownAttributeOID
 	}
 
 	if isString {
@@ -252,6 +266,7 @@ func Decode(pfxData []byte, password string) (privateKey interface{}, certificat
 		case bag.Id.Equal(oidPKCS8ShroundedKeyBag):
 			if privateKey != nil {
 				err = errors.New("pkcs12: expected exactly one key bag")
+				return nil, nil, err
 			}
 
 			if privateKey, err = decodePkcs8ShroudedKeyBag(bag.Value.Bytes, encodedPassword); err != nil {

@@ -1,3 +1,5 @@
 build/
 /gokeyless
 *.swp
+dist/
+coverage.txt

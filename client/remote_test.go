@@ -5,7 +5,6 @@ import (
 	"crypto"
 	"crypto/x509"
 	"encoding/pem"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
@@ -15,6 +14,7 @@ import (
 	"github.com/cloudflare/cfssl/helpers"
 	"github.com/cloudflare/cfssl/helpers/derhelpers"
 	"github.com/cloudflare/gokeyless/server"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -194,10 +194,11 @@ func TestSlowServer(t *testing.T) {
 	}
 	sl := slowListener{l}
 
+	errs := make(chan error, 1)
+
 	go func() {
-		if err := s2.Serve(&sl); err != nil {
-			t.Fatal(err)
-		}
+		err := s2.Serve(&sl)
+		errs <- err
 	}()
 
 	// wait for server to come up
@@ -232,11 +233,16 @@ func TestSlowServer(t *testing.T) {
 	if conn.addr != sAddr {
 		t.Fatal("bad 1st remote addr:", conn.addr)
 	}
+	select {
+	case err := <-errs:
+		require.NoError(t, err)
+	default:
+	}
 }
 
 // helper function reads a cert from a file and convert it to a signer
 func NewRemoteSignerByCertFile(filepath string) (crypto.Signer, error) {
-	pemBytes, err := ioutil.ReadFile(filepath)
+	pemBytes, err := os.ReadFile(filepath)
 	if err != nil {
 		return nil, err
 	}

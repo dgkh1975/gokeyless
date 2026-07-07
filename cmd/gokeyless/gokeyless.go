@@ -5,9 +5,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/uber/jaeger-client-go"
 
+	"github.com/spf13/afero"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"gopkg.in/yaml.v2"
@@ -29,15 +31,27 @@ const (
 	defaultEndpoint = "https://api.cloudflare.com/client/v4/certificates/"
 )
 
+func (c *Config) initializeWithDefaults() {
+	c.fs = afero.NewOsFs()
+	c.reader = os.Stdin
+}
+
 // Config represents the gokeyless configuration file.
 type Config struct {
 	LogLevel int `yaml:"loglevel" mapstructure:"loglevel"`
 
-	Hostname     string `yaml:"hostname" mapstructure:"hostname"`
-	ZoneID       string `yaml:"zone_id" mapstructure:"zone_id"`
+	Hostname string `yaml:"hostname" mapstructure:"hostname"`
+	ZoneID   string `yaml:"zone_id" mapstructure:"zone_id"`
+	// APIToken is the preferred credential: a Cloudflare API token scoped
+	// Zone -> SSL and Certificates -> Edit.
+	APIToken string `yaml:"api_token" mapstructure:"api_token"`
+	// OriginCAKey is the legacy Origin CA "Service Key" credential. Deprecated:
+	// prefer APIToken. Retained for backwards compatibility.
 	OriginCAKey  string `yaml:"origin_ca_api_key" mapstructure:"origin_ca_api_key"`
 	InitEndpoint string `yaml:"init_endpoint" mapstructure:"init_endpoint"`
 
+	fs         afero.Fs
+	reader     io.Reader
 	CertFile   string `yaml:"auth_cert" mapstructure:"auth_cert"`
 	KeyFile    string `yaml:"auth_key" mapstructure:"auth_key"`
 	CSRFile    string `yaml:"auth_csr" mapstructure:"auth_csr"`
@@ -55,6 +69,9 @@ type Config struct {
 	TracingEnabled    bool    `yaml:"tracing_enabled" mapstructure:"tracing_enabled"`
 	TracingAddress    string  `yaml:"tracing_address" mapstructure:"tracing_address"`
 	TracingSampleRate float64 `yaml:"tracing_sample_rate" mapstructure:"tracing_sample_rate"` // between 0 and 1
+
+	SignTimeout    string `yaml:"sign_timeout" mapstructure:"sign_timeout"`
+	SignRetryCount int    `yaml:"sign_retry_count" mapstructure:"sign_retry_count"`
 }
 
 // PrivateKeyStoreConfig defines a key store.
@@ -77,6 +94,7 @@ var (
 	versionMode      bool
 	helpMode         bool
 	outputConfigMode bool
+	keystoreDbgMode  bool
 
 	version = "dev"
 )
@@ -95,7 +113,8 @@ func init() {
 	viper.SetDefault("loglevel", log.LevelInfo)
 	flagset.String("hostname", "", "Hostname of this key server (must match configuration in Cloudflare dashboard)")
 	flagset.String("zone-id", "", "Cloudflare Zone ID")
-	flagset.String("origin_ca_api_key", "", "Cloudflare Origin CA API key")
+	flagset.String("api_token", "", "Cloudflare API token (scoped Zone > SSL and Certificates > Edit); preferred over origin_ca_api_key")
+	flagset.String("origin_ca_api_key", "", "Cloudflare Origin CA Service Key (deprecated; prefer api_token)")
 	flagset.String("init-endpoint", "", "Cloudflare API endpoint for server initialization")
 	viper.SetDefault("init_endpoint", defaultEndpoint)
 	flagset.MarkHidden("init-endpoint") // users should not need this
@@ -129,6 +148,7 @@ func init() {
 	flagset.BoolVar(&configMode, "config-only", false, "Perform interactive configuration, but do not run server")
 	flagset.BoolVarP(&versionMode, "version", "v", false, "Print version and exit")
 	flagset.BoolVarP(&helpMode, "help", "h", false, "Print usage exit")
+	flagset.BoolVarP(&keystoreDbgMode, "keystore-debug", "d", false, "try to connect to the defined keystores")
 	// Temporary option to demo config overrides.
 	flagset.BoolVarP(&outputConfigMode, "output-config", "o", false, "Print usage exit")
 	flagset.MarkHidden("output_config")
@@ -136,11 +156,12 @@ func init() {
 
 func initConfig() error {
 	pflag.Parse()
-	viper.BindPFlags(pflag.CommandLine)
+	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
+		return err
+	}
 	viper.AutomaticEnv()
 	viper.SetEnvPrefix("KEYLESS")
 
-	viper.SetConfigType("yaml")
 	if configFile != "" {
 		viper.SetConfigFile(configFile)
 	} else {
@@ -201,29 +222,38 @@ func initConfig() error {
 
 	return nil
 }
-
 func main() {
-	if err := initConfig(); err != nil {
+	if err := runMain(); err != nil {
 		log.Fatal(err)
 	}
+}
+func runMain() error {
+	if err := initConfig(); err != nil {
+		return err
+	}
 	log.Level = config.LogLevel
+	config.initializeWithDefaults()
 
 	switch {
 	case helpMode:
 		pflag.Usage()
-		os.Exit(0)
+		return nil
 	case versionMode:
 		fmt.Println("gokeyless version", version)
-		os.Exit(0)
+		if info, ok := debug.ReadBuildInfo(); ok {
+			fmt.Printf("%s built with %s\n", info.Path, info.GoVersion)
+		}
+
+		return nil
 	case manualMode && configMode:
-		log.Fatal("can't specify both -manual-activation and -config-only!")
+		return fmt.Errorf("can't specify both --manual-activation and --config-only")
 	case manualMode:
 		// Allow manual activation (requires the CSR to be manually signed).
 		// manual activation won't proceed to start the server
 		log.Info("now check server csr and key")
-		if !verifyCSRAndKey() {
+		if !config.verifyCSRAndKey() {
 			log.Info("csr and key are not usable. generating server csr and key")
-			manualActivation()
+			config.manualActivation()
 
 			log.Infof("contact Cloudflare for manual signing of csr in %q",
 				config.CSRFile)
@@ -231,22 +261,32 @@ func main() {
 			log.Infof("csr at %q and private key at %q are already generated and verified correctly, please contact Cloudflare for manual signing",
 				config.CSRFile, config.KeyFile)
 		}
-		os.Exit(0)
+		return nil
 	case configMode:
-		if needNewCertAndKey() {
-			initializeServerCertAndKey()
+		if config.needNewCertAndKey() {
+			if err := config.initializeServerCertAndKey(); err != nil {
+				log.Fatalf("failed to initialize: %s", err)
+			}
 		} else {
 			log.Info("already configured; exiting")
 		}
-		os.Exit(0)
+		return nil
 	case outputConfigMode:
 		b, err := yaml.Marshal(config)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		fmt.Print(string(b))
-		os.Exit(0)
+		return nil
+
+	case keystoreDbgMode:
+		log.Level = log.LevelDebug
+
+		_, err := initKeyStore(config.PrivateKeyStores...)
+		return err
+
 	}
+
 	if config.TracingEnabled {
 		// jaeger failing to connect to the agent / initializing shouldn't prevent keyless from starting,
 		// so if we encounter an error we should log it but move on.
@@ -268,27 +308,38 @@ func main() {
 	// and log an error instead (in case the server is running as a daemon).
 	// Failing hard with an error message makes the problem obvious, whereas a
 	// daemon blocked waiting on input can be hard to debug.
-	if needNewCertAndKey() {
-		if needInteractivePrompt() {
-			log.Error("the server cert/key need to be generated; set the hostname, zone_id, and origin_ca_api_key values in your config file, or run the server with either the -config-only or -manual-activation flag to generate the pair interactively")
-			os.Exit(1)
+	if config.needNewCertAndKey() {
+		if config.needInteractivePrompt() {
+			return fmt.Errorf("the server cert/key need to be generated; set the hostname, zone_id, and api_token (or the deprecated origin_ca_api_key) values in your config file, or run the server with either the --config-only or --manual-activation flag to generate the pair interactively")
 		}
-		initializeServerCertAndKey()
+		if err := config.initializeServerCertAndKey(); err != nil {
+			log.Fatalf("failed to initialize: %s", err)
+		}
 	}
 
 	cfg := server.DefaultServeConfig()
+	if config.SignTimeout != "" {
+		signTimeoutDuration, err := time.ParseDuration(config.SignTimeout)
+		if err != nil {
+			log.Fatalf("failed to parse signTimeout: %s", err)
+		}
+		cfg = cfg.WithSignTimeout(signTimeoutDuration)
+	}
+	if config.SignRetryCount > 0 {
+		cfg = cfg.WithSignRetryCount(config.SignRetryCount)
+	}
 	s, err := server.NewServerFromFile(cfg, config.CertFile, config.KeyFile, config.CACertFile)
 	if err != nil {
-		log.Fatal("cannot start server:", err)
+		return fmt.Errorf("cannot start server: %w", err)
 	}
 
 	if !currentTime.IsZero() {
 		s.TLSConfig().Time = func() time.Time { return currentTime }
 	}
 
-	keys, err := initKeyStore()
+	keys, err := initKeyStore(config.PrivateKeyStores...)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	s.SetKeystore(keys)
 
@@ -300,17 +351,23 @@ func main() {
 			f.Close()
 		}
 	}
-	certs := gatherCerts()
+	certs, err := certmetrics.GatherFromPaths([]string{
+		config.CertFile,
+		config.CACertFile,
+	})
+	if err != nil {
+		return err
+	}
 	certmetrics.Observe(certs...)
 	go func() {
 		log.Critical(s.MetricsListenAndServe(net.JoinHostPort("", strconv.Itoa(config.MetricsPort))))
 	}()
-	log.Fatal(s.ListenAndServe(net.JoinHostPort("", strconv.Itoa(config.Port))))
+	return s.ListenAndServe(net.JoinHostPort("", strconv.Itoa(config.Port)))
 }
 
-func initKeyStore() (server.Keystore, error) {
+func initKeyStore(privateKeyStores ...PrivateKeyStoreConfig) (server.Keystore, error) {
 	keys := server.NewDefaultKeystore()
-	for _, store := range config.PrivateKeyStores {
+	for _, store := range privateKeyStores {
 		switch {
 		case store.Dir != "":
 			if err := keys.AddFromDir(store.Dir, server.DefaultLoadKey); err != nil {
@@ -321,7 +378,7 @@ func initKeyStore() (server.Keystore, error) {
 				return nil, err
 			}
 		case store.URI != "":
-			if err := keys.AddFromURI(store.URI, loadURI); err != nil {
+			if err := keys.AddFromURI(store.URI); err != nil {
 				return nil, err
 			}
 		}
@@ -352,15 +409,15 @@ func validCertExpiry(cert *x509.Certificate) bool {
 }
 
 // needNewCertAndKey checks the validity of certificate and key
-func needNewCertAndKey() bool {
-	_, err := tls.LoadX509KeyPair(config.CertFile, config.KeyFile)
+func (c Config) needNewCertAndKey() bool {
+	_, err := tls.LoadX509KeyPair(c.CertFile, c.KeyFile)
 	if err != nil {
 		log.Errorf("cannot load server cert/key: %v", err)
 		return true
 	}
 
 	// error is ignore because tls.LoadX509KeyPair already verify the existence of the file
-	certBytes, _ := ioutil.ReadFile(config.CertFile)
+	certBytes, _ := os.ReadFile(c.CertFile)
 	// error is ignore because tls.LoadX509KeyPair already verify the file can be parsed
 	cert, _ := helpers.ParseCertificatePEM(certBytes)
 	// verify the leaf certificate
@@ -373,8 +430,8 @@ func needNewCertAndKey() bool {
 }
 
 // verifyCSRAndKey checks if csr and key files exist and if they match
-func verifyCSRAndKey() bool {
-	csrBytes, err := ioutil.ReadFile(config.CSRFile)
+func (c Config) verifyCSRAndKey() bool {
+	csrBytes, err := os.ReadFile(c.CSRFile)
 	if err != nil {
 		log.Errorf("cannot read csr file: %v", err)
 		return false
@@ -397,7 +454,7 @@ func verifyCSRAndKey() bool {
 		return false
 	}
 
-	keyBytes, err := ioutil.ReadFile(config.KeyFile)
+	keyBytes, err := os.ReadFile(c.KeyFile)
 	if err != nil {
 		log.Errorf("cannot read private key file: %v", err)
 		return false
@@ -421,37 +478,4 @@ func verifyCSRAndKey() bool {
 	}
 
 	return true
-}
-
-// pemCertsFromFile reads PEM format certificates from a file.
-func pemCertsFromFile(path string) []*x509.Certificate {
-	file, err := os.Open(path)
-	if err != nil {
-		log.Fatal(err)
-	}
-	pemData, err := ioutil.ReadAll(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-	certs, err := helpers.ParseCertificatesPEM(pemData)
-	if err != nil {
-		log.Fatal(err)
-	}
-	return certs
-}
-
-func gatherCerts() []*x509.Certificate {
-	certPaths := []string{
-		config.CertFile,
-		config.CACertFile,
-	}
-	var allCerts []*x509.Certificate
-	for _, cPath := range certPaths {
-		if cPath == "" {
-			continue
-		}
-		pemCerts := pemCertsFromFile(cPath)
-		allCerts = append(allCerts, pemCerts...)
-	}
-	return allCerts
 }

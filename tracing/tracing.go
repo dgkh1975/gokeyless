@@ -12,6 +12,7 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 	opentracing_log "github.com/opentracing/opentracing-go/log"
+	"github.com/uber/jaeger-client-go"
 )
 
 // SpanContextFromBinary builds span context based on binary-encoded bytes (e.g. for servers)
@@ -22,7 +23,17 @@ func SpanContextFromBinary(spanData []byte) (opentracing.SpanContext, error) {
 		return nil, nil
 	}
 	var scReader = bytes.NewReader(spanData)
-	return opentracing.GlobalTracer().Extract(opentracing.Binary, scReader)
+	sc, err := opentracing.GlobalTracer().Extract(opentracing.Binary, scReader)
+	if err != nil {
+		carrier := opentracing.TextMapCarrier{
+			jaeger.TraceContextHeaderName: string(spanData),
+		}
+		sc, err = opentracing.GlobalTracer().Extract(opentracing.TextMap, &carrier)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return sc, nil
 }
 
 // SpanContextToBinary returns bytes representing the binary-encoded span context (e.g. for clients)
@@ -39,14 +50,16 @@ func SpanContextToBinary(sc opentracing.SpanContext) ([]byte, error) {
 // SetOperationSpanTags sets span tags with all of the operation's fields
 func SetOperationSpanTags(span opentracing.Span, op *protocol.Operation) {
 	tags := map[string]interface{}{
-		"operation.opcode":         op.Opcode.String(),
-		"operation.ski":            op.SKI,
-		"operation.digest":         fmt.Sprintf("%02x", op.Digest),
-		"operation.clientip":       op.ClientIP,
-		"operation.serverip":       op.ServerIP,
-		"operation.sni":            op.SNI,
-		"operation.certid":         op.CertID,
-		"operation.customfuncname": op.CustomFuncName,
+		"operation.opcode":            op.Opcode.String(),
+		"operation.ski":               op.SKI,
+		"operation.digest":            fmt.Sprintf("%02x", op.Digest),
+		"operation.clientip":          op.ClientIP,
+		"operation.serverip":          op.ServerIP,
+		"operation.sni":               op.SNI,
+		"operation.certid":            op.CertID,
+		"operation.customfuncname":    op.CustomFuncName,
+		"operation.forwardingsvc":     fmt.Sprintf("%d", op.ForwardingSvc),
+		"operation.compliance_region": op.ComplianceRegion.String(),
 	}
 	for k, v := range tags {
 		span.SetTag(k, v)

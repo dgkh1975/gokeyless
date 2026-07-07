@@ -13,6 +13,7 @@ import (
 
 	"github.com/cloudflare/cfssl/log"
 	"github.com/cloudflare/gokeyless/protocol"
+	"github.com/cloudflare/gokeyless/server"
 	"github.com/cloudflare/gokeyless/tracing"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
@@ -65,15 +66,13 @@ func signOpFromSignerOpts(key *PrivateKey, opts crypto.SignerOpts) protocol.Op {
 	case *rsa.PublicKey:
 		if value, ok := rsaCrypto[opts.HashFunc()]; ok {
 			return value
-		} else {
-			return protocol.OpError
 		}
+		return protocol.OpError
 	case *ecdsa.PublicKey:
 		if value, ok := ecdsaCrypto[opts.HashFunc()]; ok {
 			return value
-		} else {
-			return protocol.OpError
 		}
+		return protocol.OpError
 	case ed25519.PublicKey:
 		return protocol.OpEd25519Sign
 	default:
@@ -94,7 +93,8 @@ type PrivateKey struct {
 
 	// We have shove the span context inside PrivateKey because
 	// it's used by calling functions on the `crypto.Signer` interface, which don't take ctx as a parameter.
-	JaegerSpan []byte
+	JaegerSpan       []byte
+	complianceRegion protocol.ComplianceRegion
 }
 
 // Public returns the public key corresponding to the opaque private key.
@@ -112,12 +112,12 @@ func (key *PrivateKey) execute(ctx context.Context, op protocol.Op, msg []byte) 
 	for attempts := 2; attempts > 0; attempts-- {
 		r, err := key.client.getRemote(key.keyserver)
 		if err != nil {
-			return nil, err
+			return nil, server.RemoteConfigurationErr{Err: err}
 		}
 
 		conn, err := r.Dial(key.client)
 		if err != nil {
-			return nil, err
+			return nil, server.RemoteConfigurationErr{Err: err}
 		}
 
 		// We explicitly do NOT want to fill in JaegerSpan here, since the remote keyless server
@@ -125,13 +125,14 @@ func (key *PrivateKey) execute(ctx context.Context, op protocol.Op, msg []byte) 
 		// https://github.com/cloudflare/gokeyless/pull/276 makes it safe to fill it in,
 		// but there's no way to know the version of the remote keyserver
 		result, err = conn.Conn.DoOperation(ctx, protocol.Operation{
-			Opcode:   op,
-			Payload:  msg,
-			SKI:      key.ski,
-			ClientIP: key.clientIP,
-			ServerIP: key.serverIP,
-			SNI:      key.sni,
-			CertID:   key.certID,
+			Opcode:           op,
+			Payload:          msg,
+			SKI:              key.ski,
+			ClientIP:         key.clientIP,
+			ServerIP:         key.serverIP,
+			SNI:              key.sni,
+			CertID:           key.certID,
+			ComplianceRegion: key.complianceRegion,
 		})
 		if err != nil {
 			conn.Close()
